@@ -8,6 +8,12 @@ protected int(0..3) qos_level = 0;
 protected int(0..1) dup_flag = 0;
 protected int(0..1) retain_flag = 0;
 
+#ifdef MQTT_DEBUG
+#define DEBUG(X ...) werror("MQTT: " + X)
+#else
+#define DEBUG(X ...)
+#endif /* MQTT_DEBUG */
+
 
 protected void create() { throw(Error.Generic("Creation not allowed\n")); }
 
@@ -45,7 +51,7 @@ string encode() {
   string body = buf->read();
   
   int remaining_length = sizeof(body);
-  werror("remaining length: %d %O\n", remaining_length, sprintf("%c", remaining_length));
+  DEBUG("remaining length: %d %O\n", remaining_length, sprintf("%c", remaining_length));
   do {
     int digit = remaining_length % 128;
     remaining_length = remaining_length / 128;
@@ -80,7 +86,7 @@ void encode_word(Stdio.Buffer buf, int word) {
   buf->add_int16(word);
 }
 
-int read_int(Stdio.Buffer buf) {
+int read_byte(Stdio.Buffer buf) {
   return buf->read_int8();
 }
 

@@ -16,5 +16,14 @@ void decode_body(Stdio.Buffer body) {
   // first the variable header
   topic = read_string(body);
   message_identifier = read_word(body);
-  body = read_string(body);
+  this.body = read_string(body);
+}
+
+void encode_variable_header(Stdio.Buffer body) {
+	encode_string(body, topic);
+	encode_word(body, message_identifier);
+}
+
+void encode_payload(Stdio.Buffer body) {
+	encode_string(body, this.body);
 }

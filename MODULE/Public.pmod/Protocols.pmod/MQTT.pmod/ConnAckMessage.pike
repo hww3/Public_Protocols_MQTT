@@ -14,8 +14,8 @@ protected void create() {}
 
 void decode_body(Stdio.Buffer body) {
   // first the variable header
-  compression_flags = read_int(body); // reserved
-  response_code = read_int(body);
+  compression_flags = read_byte(body); // reserved
+  response_code = read_byte(body);
   response_text = response_texts[response_code] || "Unknown";
   
 }
