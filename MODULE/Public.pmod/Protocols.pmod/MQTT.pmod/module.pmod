@@ -15,6 +15,7 @@ protected void create() {
   message_registry[.ConnectMessage.MESSAGE_NUMBER] = .ConnectMessage; 
   message_registry[.ConnAckMessage.MESSAGE_NUMBER] = .ConnAckMessage; 
   message_registry[.PublishMessage.MESSAGE_NUMBER] = .PublishMessage;  
+  message_registry[.PubAckMessage.MESSAGE_NUMBER] = .PubAckMessage;
   message_registry[.SubscribeMessage.MESSAGE_NUMBER] = .SubscribeMessage;
   message_registry[.SubscribeAckMessage.MESSAGE_NUMBER] = .SubscribeAckMessage;
   message_registry[.UnsubscribeMessage.MESSAGE_NUMBER] = .UnsubscribeMessage;

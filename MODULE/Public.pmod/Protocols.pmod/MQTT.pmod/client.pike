@@ -29,7 +29,9 @@ protected function(.client:void) connect_cb;
 protected function(.client:void) disconnect_cb;
 protected mixed timeout_callout_id;
 
-protected int response_timeout = 10;
+protected int(0..2) qos_level = 0;
+protected int response_timeout = 5;
+protected int publish_response_timeout = 5;
 protected int max_retries = 1;
 
 mapping(string:multiset) publish_callbacks = ([]);
@@ -41,10 +43,11 @@ protected int current_header;
 protected int current_length;
 protected array(int) length_bytes = ({});
 
+Thread.Mutex await_mutex = Thread.Mutex();
+
 // protocol state
 protected int wrote_connect;
 protected int message_identifier = 0;
-protected int packet_identifier = 0;
 
 protected mapping(int:.Message) pending_responses = ([]);
 
@@ -80,6 +83,18 @@ protected variant void create(string _connect_url) {
 
 //!
 int is_connected() { return connection_state == CONNECTED; }
+
+//! sets the QOS level for all subscriptions on this client
+void set_qos_level(int(0..2) level) { qos_level = level; }
+
+//! the seconds to wait for a response from the server for acknowledged publish requests
+//! 
+//! as published messages could be larger and require more time to transmit, this timeout
+//! is configurable seprately from the acknowledged request timeout used by subscribe and 
+//! unsubscribe messages.
+void set_publish_response_timeout(int secs) {
+  response_timeout = secs;
+}
 
 //! the seconds to wait for a response from the server for acknowledged requests
 void set_response_timeout(int secs) {
@@ -183,15 +198,28 @@ protected void low_disconnect() {
 }
 
 //!
-void publish(string topic, string msg) {
+void publish(string topic, string msg, int|void qos_level) {
   check_connected();  
   
   .PublishMessage message = .PublishMessage();
   message->topic = topic;
   message->message_identifier = get_message_identifier();
   message->body = msg;
+  message->set_qos_level(qos_level);
   
-  send_message(message);
+  switch(qos_level) {
+    case 0:  // AT_MOST_ONCE
+      send_message(message);
+      break;
+    case 1:  // AT_LEAST_ONCE
+      message->message_identifier = get_message_identifier();
+      .Message response = send_message_await_response(message, publish_response_timeout);
+      if(!response) throw(Error.Generic("Publish message (QOS=AT_LEAST_ONCE) was not acknowledged by server.\n"));
+      else { DEBUG("Got response for publish of message id %d\n", message->message_identifier); }
+      break;
+    default:
+      throw(Error.Generic("Unsupported QOS Level: " + qos_level + "\n"));
+  }
 }
 
 //!
@@ -199,15 +227,14 @@ void subscribe(string topic, function(.client,string,string:void) publish_cb) {
     check_connected();  
   
     .SubscribeMessage message = .SubscribeMessage();
-    message->packet_identifier = get_packet_identifier();
-    message->topics += ({ ({topic, 0}) }); // basic level of QOS
+    message->message_identifier = get_message_identifier();
+    message->topics += ({ ({topic, qos_level}) });
 
     if(!publish_callbacks[topic])
   	  publish_callbacks[topic] = (<>);
 
     publish_callbacks[topic] += (<publish_cb>);		  
-    // should be send_message_await_response()  
-    .Message response = send_message_await_response(message);
+    .Message response = send_message_await_response(message, response_timeout);
     if(!response) throw(Error.Generic("Subscribe was not acknowledged.\n"));
 
 }
@@ -220,10 +247,9 @@ void unsubscribe(string topic, function(.client,string,string:void) publish_cb) 
 	if(cbs[publish_cb]) cbs[publish_cb] = 0;
 	if(!sizeof(cbs)) {
 	    .UnsubscribeMessage message = .UnsubscribeMessage();
-	    message->packet_identifier = get_packet_identifier();
+	    message->message_identifier = get_message_identifier();
 	    message->topics += ({topic});
-	    // should be send_message_await_response()  
-	    .Message response = send_message_await_response(message);
+	    .Message response = send_message_await_response(message, response_timeout);
 	    if(!response) throw(Error.Generic("Unsubscribe was not acknowledged.\n"));
 		m_delete(publish_callbacks, topic);
 	}
@@ -236,10 +262,6 @@ protected void check_connected() {
 
 protected int get_message_identifier() {
 	return ++message_identifier;
-}
-
-protected int get_packet_identifier() {
-	return ++packet_identifier;
 }
 
 protected void send_message(.Message m) {
@@ -264,44 +286,52 @@ protected void send_message_sync(.Message m) {
    timeout_callout_id = call_out(send_ping, (timeout > 1? timeout - 1: 0.5));
 }
 
-protected .Message send_message_await_response(.Message m) {
+protected .Message send_message_await_response(.Message m, int timeout) {
   .Message r = 0;
-  int packet_identifier = m->packet_identifier;
+  int message_identifier = m->message_identifier;
 
-  if(!packet_identifier) throw(Error.Generic("No packet identifier specified. Cannot receive a response.\n"));
+  if(!message_identifier) throw(Error.Generic("No message identifier specified. Cannot receive a response.\n"));
   int attempts = 0;
 
-  register_pending(packet_identifier);
+  register_pending(message_identifier);
   do {
     send_message(m);
-    r = await_response(packet_identifier, response_timeout);
+    r = await_response(message_identifier, timeout);
     if(r) break;
     m->dup_flag = 1;
   }  while(attempts++ < max_retries);
 
-  unregister_pending(packet_identifier);
+  unregister_pending(message_identifier);
 
   return r;
 }
 
-Thread.Mutex await_mutex = Thread.Mutex();
-
-protected .Message await_response(int packet_identifier, int timeout) {
+protected .Message await_response(int message_identifier, int timeout) {
   .Message m = 0;
   float f = (float)timeout;
   
-  DEBUG("await_response %d\n", packet_identifier);
-  if((m = pending_responses[packet_identifier])) 
+  DEBUG("await_response %d\n", message_identifier);
+  int was_locked;
+  
+  object key = await_mutex->trylock();
+  
+  if(m = pending_responses[message_identifier])
     return m;
 
-  object key = await_mutex->lock();
+  if(!key) {
+    key = await_mutex->lock();
+    if(m = pending_responses[message_identifier]) { 
+      key = 0;
+      return m;
+    }
+  }
   Pike.Backend orig = conn->query_backend();
   Pike.Backend b = Pike.Backend();
   conn->set_backend(b);
   while(f > 0.0) {
-    DEBUG("waiting for message %d\n", packet_identifier);
+    DEBUG("waiting for message %d\n", message_identifier);
     f = f - b(f);
-    if((m = pending_responses[packet_identifier])) 
+    if((m = pending_responses[message_identifier])) 
       break;
   }
 
@@ -310,14 +340,14 @@ protected .Message await_response(int packet_identifier, int timeout) {
   return m; // timeout
 }
 
-protected void register_pending(int packet_identifier) {
-  pending_responses[packet_identifier] = 0;
+protected void register_pending(int message_identifier) {
+  pending_responses[message_identifier] = 0;
 }
 
-protected void unregister_pending(int packet_identifier) {
-  if(has_index(pending_responses, packet_identifier)) {
-    DEBUG("clearing pending response marker for %d\n", packet_identifier);
-    m_delete(pending_responses, packet_identifier);
+protected void unregister_pending(int message_identifier) {
+  if(has_index(pending_responses, message_identifier)) {
+    DEBUG("clearing pending response marker for %d\n", message_identifier);
+    m_delete(pending_responses, message_identifier);
   }
 }
 
@@ -442,11 +472,12 @@ protected void read_cb(mixed id, object data) {
 
 protected void process_message(.Message message) {
   DEBUG("got message: %O\n", message);
-  int packet_identifier = message->packet_identifier;
-  if(packet_identifier) {
-    DEBUG("Got a message with a packet_identifier: %d\n", packet_identifier);
-    if(has_index(pending_responses, packet_identifier)) pending_responses[packet_identifier] = message;
+  int message_identifier = message->message_identifier;
+  if(message_identifier) {
+    DEBUG("Got a message with a message_identifier: %d\n", message_identifier);
+    if(has_index(pending_responses, message_identifier)) pending_responses[message_identifier] = message;
   }
+  
   if(object_program(message) == .ConnAckMessage) {
     if(connection_state != CONNECTING) 
       throw(Error.Generic("Received CONNACK at invalid point, disconnecting.\n"));
@@ -456,16 +487,41 @@ protected void process_message(.Message message) {
     }
     connection_state = CONNECTED;
     DEBUG("%O got connect response code: %O\n", this, message->response_code);
-	if(connect_cb) connect_cb(this);
+  	if(connect_cb) connect_cb(this);
   }
   
   else if(object_program(message) == .PublishMessage) {
 	  multiset cbs; 
+	  
+    int qos = message->get_qos_level();
+	  DEBUG("PublishMessage topic: %s (qos=%d), %O\n", message->topic, qos, message->body);
 	  if((cbs = publish_callbacks[message->topic])) {
-		  foreach(cbs; function callback;) {
-			  DEBUG("Scheduling delivery of message from %s to %O\n", message->topic, callback);
-			  call_out(callback, 0, this, message->topic, message->body);
-		  }
+		  switch(qos) {
+		    case 0:
+    		  foreach(cbs; function callback;) {
+    		    DEBUG("Scheduling delivery of message from %s to %O\n", message->topic, callback);
+		  	    call_out(callback, 0, this, message->topic, message->body);
+		  	  }
+		      break;
+		    case 1:
+	      case 2: // TODO properly support QOS EXACTLY_ONCE
+	        int have_errors = 0;
+				  foreach(cbs; function callback;) {
+    		    DEBUG("Performing delivery of message from %s to %O\n", message->topic, callback);
+		          mixed e = catch(callback(this, message->topic, message->body));
+		        if(e) { 
+		          have_errors++; 
+		          report_error(e);
+		        }
+		      }
+		      if(!have_errors) acknowledge_pub(message);
+		      else
+		      {
+		        werror("One or more callbacks to an AT_LEAST_ONCE publish message failed. Not acknowledging, duplicates may occur.\n");
+		      }
+	        break;
+		    }
+		
 	  }
 	  else {
    	    DEBUG("WARNING: got publish message for something we have no record of subscribing to: " + message->topic + "\n");
@@ -479,6 +535,16 @@ protected void process_message(.Message message) {
       DEBUG("%O unsubscribe got response\n", this);
   }
 
+}
+
+protected void report_error(mixed error) {
+  werror(master()->describe_backtrace(error));
+}
+
+void acknowledge_pub(.Message message) {
+   .Message response = .PubAckMessage();
+   response->message_identifier = message->message_identifier;
+   send_message(response);
 }
   
 protected string _sprintf(mixed t) {

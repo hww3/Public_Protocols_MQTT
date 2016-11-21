@@ -4,7 +4,7 @@ constant MESSAGE_NUMBER = 0;
 constant has_payload = 0;
 constant has_variable_header = 0;
 
-protected int(0..3) qos_level = 0;
+protected int(0..2) qos_level = 0;
 protected int(0..1) dup_flag = 0;
 protected int(0..1) retain_flag = 0;
 
@@ -16,6 +16,8 @@ protected int(0..1) retain_flag = 0;
 
 
 protected void create() { throw(Error.Generic("Creation not allowed\n")); }
+
+int get_qos_level() { return qos_level; }
 
 void decode(int header, Stdio.Buffer body) {
 
