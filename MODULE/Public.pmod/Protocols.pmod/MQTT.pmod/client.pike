@@ -12,6 +12,7 @@ protected string password;
 
 protected Stdio.Buffer buf;
 protected Stdio.Buffer outbuf;
+protected Pike.Backend backend;
 
 constant NOT_CONNECTED = 0;
 constant CONNECTING = 1;
@@ -28,6 +29,9 @@ protected function(.client:void) connect_cb;
 protected function(.client:void) disconnect_cb;
 protected mixed timeout_callout_id;
 
+protected int response_timeout = 10;
+protected int max_retries = 1;
+
 mapping(string:multiset) publish_callbacks = ([]);
 
 // packet parsing state
@@ -42,6 +46,8 @@ protected int wrote_connect;
 protected int message_identifier = 0;
 protected int packet_identifier = 0;
 
+protected mapping(int:.Message) pending_responses = ([]);
+
 //! MQTT client
 //!
 //! Limitations:
@@ -51,9 +57,7 @@ protected int packet_identifier = 0;
 
 //!
 protected variant void create(string _host, int _port) {
-   host = _host;
-   port = _port;
-   connect_url = Standards.URI("mqtt://" + host + ":" + port);
+   create("mqtt://" + host + ":" + port);
 }
 
 //!
@@ -70,10 +74,22 @@ protected variant void create(string _connect_url) {
 		if(connect_url->scheme == "mqtts") port = 8883;
 		else port = 1883;
 	}
+	
+	backend = Pike.DefaultBackend;
 }
 
 //!
 int is_connected() { return connection_state == CONNECTED; }
+
+//! the seconds to wait for a response from the server for acknowledged requests
+void set_response_timeout(int secs) {
+  response_timeout = secs;
+}
+
+//! number of times to retry transmission for requests whose acknowledgements have timed out
+void set_retry_attempts(int count) {
+  max_retries = count;
+}
 
 //!
 variant void connect(function(.client:void) _connect_cb) {
@@ -99,7 +115,8 @@ variant void connect() {
 	   DEBUG("Starting SSL/TLS\n");
        conn = SSL.File(conn, SSL.Context());
 	   conn->set_blocking();
-	   werror("TLS: %O\n", conn->connect(host));
+	   if(!conn->connect(host))
+	     throw(Error.Generic("Unable to start TLS session with MQTT server.\n"));
 	   conn->write("");
    }
 
@@ -182,6 +199,7 @@ void subscribe(string topic, function(.client,string,string:void) publish_cb) {
     check_connected();  
   
     .SubscribeMessage message = .SubscribeMessage();
+    message->packet_identifier = get_packet_identifier();
     message->topics += ({ ({topic, 0}) }); // basic level of QOS
 
     if(!publish_callbacks[topic])
@@ -189,20 +207,24 @@ void subscribe(string topic, function(.client,string,string:void) publish_cb) {
 
     publish_callbacks[topic] += (<publish_cb>);		  
     // should be send_message_await_response()  
-    send_message(message);
+    .Message response = send_message_await_response(message);
+    if(!response) throw(Error.Generic("Subscribe was not acknowledged.\n"));
+
 }
 
 //!
 void unsubscribe(string topic, function(.client,string,string:void) publish_cb) {
     check_connected();  
     multiset cbs = publish_callbacks[topic];
-    if(!cbs) return;
+    if(!cbs) return 0;
 	if(cbs[publish_cb]) cbs[publish_cb] = 0;
 	if(!sizeof(cbs)) {
 	    .UnsubscribeMessage message = .UnsubscribeMessage();
+	    message->packet_identifier = get_packet_identifier();
 	    message->topics += ({topic});
 	    // should be send_message_await_response()  
-	    send_message(message);
+	    .Message response = send_message_await_response(message);
+	    if(!response) throw(Error.Generic("Unsubscribe was not acknowledged.\n"));
 		m_delete(publish_callbacks, topic);
 	}
 }
@@ -242,6 +264,62 @@ protected void send_message_sync(.Message m) {
    timeout_callout_id = call_out(send_ping, (timeout > 1? timeout - 1: 0.5));
 }
 
+protected .Message send_message_await_response(.Message m) {
+  .Message r = 0;
+  int packet_identifier = m->packet_identifier;
+
+  if(!packet_identifier) throw(Error.Generic("No packet identifier specified. Cannot receive a response.\n"));
+  int attempts = 0;
+
+  register_pending(packet_identifier);
+  do {
+    send_message(m);
+    r = await_response(packet_identifier, response_timeout);
+    if(r) break;
+    m->dup_flag = 1;
+  }  while(attempts++ < max_retries);
+
+  unregister_pending(packet_identifier);
+
+  return r;
+}
+
+Thread.Mutex await_mutex = Thread.Mutex();
+
+protected .Message await_response(int packet_identifier, int timeout) {
+  .Message m = 0;
+  float f = (float)timeout;
+  
+  DEBUG("await_response %d\n", packet_identifier);
+  if((m = pending_responses[packet_identifier])) 
+    return m;
+
+  object key = await_mutex->lock();
+  Pike.Backend orig = conn->query_backend();
+  Pike.Backend b = Pike.Backend();
+  conn->set_backend(b);
+  while(f > 0.0) {
+    DEBUG("waiting for message %d\n", packet_identifier);
+    f = f - b(f);
+    if((m = pending_responses[packet_identifier])) 
+      break;
+  }
+
+  conn->set_backend(orig);
+  key = 0;
+  return m; // timeout
+}
+
+protected void register_pending(int packet_identifier) {
+  pending_responses[packet_identifier] = 0;
+}
+
+protected void unregister_pending(int packet_identifier) {
+  if(has_index(pending_responses, packet_identifier)) {
+    DEBUG("clearing pending response marker for %d\n", packet_identifier);
+    m_delete(pending_responses, packet_identifier);
+  }
+}
 
 protected int get_digit(Stdio.Buffer buf, int digit) {
   if(sizeof(length_bytes) > digit)
@@ -289,9 +367,7 @@ protected int write_cb(mixed id) {
        int sent = conn->write(s);
 	   tot += sent;
 	   if(tot < tosend && sent > 0) s = s[sent..];
-	   if(sent > 0) werror("sent something: %d of %d\n", tot, tosend);
-      }
-      //int r = conn->write(s);
+    }
 	  DEBUG("wrote %d\n", tot);
 	  return tot;
   
@@ -334,7 +410,7 @@ protected void read_cb(mixed id, object data) {
      do {
         digit = get_digit(buf, t);
         t++;
-        if(digit == -1) return;
+        if(digit == -1) return 0;
         value += (digit & 127) * multiplier;
         multiplier *= 128;
       }
@@ -366,6 +442,11 @@ protected void read_cb(mixed id, object data) {
 
 protected void process_message(.Message message) {
   DEBUG("got message: %O\n", message);
+  int packet_identifier = message->packet_identifier;
+  if(packet_identifier) {
+    DEBUG("Got a message with a packet_identifier: %d\n", packet_identifier);
+    if(has_index(pending_responses, packet_identifier)) pending_responses[packet_identifier] = message;
+  }
   if(object_program(message) == .ConnAckMessage) {
     if(connection_state != CONNECTING) 
       throw(Error.Generic("Received CONNACK at invalid point, disconnecting.\n"));
