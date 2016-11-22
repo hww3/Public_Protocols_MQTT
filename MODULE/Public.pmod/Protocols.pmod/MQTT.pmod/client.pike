@@ -13,7 +13,8 @@ protected string password;
 protected Stdio.Buffer buf;
 protected Stdio.Buffer outbuf;
 protected Pike.Backend backend;
-
+protected Pike.Backend await_backend = Pike.Backend();
+protected ADT.Queue ping_timeout_callout_ids = ADT.Queue();
 constant NOT_CONNECTED = 0;
 constant CONNECTING = 1;
 constant CONNECTED = 2;
@@ -23,10 +24,11 @@ constant CONNECT_STATES = ([0: "NOT_CONNECTED", 1: "CONNECTING", 2: "CONNECTED"]
 protected int connection_state = NOT_CONNECTED;
 
 protected Standards.URI connect_url;
+protected SSL.Context ssl_context;
 protected string client_identifier;
 protected int timeout = 10;
 protected function(.client:void) connect_cb;
-protected function(.client:void) disconnect_cb;
+protected function(.client,.Reason:void) disconnect_cb;
 protected mixed timeout_callout_id;
 
 protected int(0..2) qos_level = 0;
@@ -55,15 +57,18 @@ protected mapping(int:.Message) pending_responses = ([]);
 //!
 //! Limitations:
 //! 
-//! currently does not support QOS levels greater than zero
 //! error checking is less than ideal
+
 
 //!
 protected variant void create(string _host, int _port) {
    create("mqtt://" + host + ":" + port);
 }
 
+//! create a client 
 //!
+//! @param _connect_url
+//!   A url in the form of mqtt://username:password@server:port or mqtts://username:password@server:port
 protected variant void create(string _connect_url) {
     connect_url = Standards.URI(_connect_url);
 	if(!(<"mqtt", "mqtts">)[connect_url->scheme]) throw(Error.Generic("Connect url must be of type mqtt or mqtts.\n"));
@@ -128,7 +133,7 @@ variant void connect() {
 
    if(connect_url->scheme == "mqtts") {
 	   DEBUG("Starting SSL/TLS\n");
-       conn = SSL.File(conn, SSL.Context());
+       conn = SSL.File(conn, ssl_context || SSL.Context());
 	   conn->set_blocking();
 	   if(!conn->connect(host))
 	     throw(Error.Generic("Unable to start TLS session with MQTT server.\n"));
@@ -162,8 +167,13 @@ variant void connect() {
 }
 
 //!
-void set_disconnect_callback(function(.client:void) cb) {
+void set_disconnect_callback(function(.client,.Reason:void) cb) {
 	disconnect_cb = cb;
+}
+
+//! 
+void set_ssl_context(SSL.Context context) {
+  ssl_context = context;
 }
 
 //!
@@ -184,16 +194,16 @@ void set_client_identifier(string id) {
 //!
 void disconnect() {
   check_connected();
-  low_disconnect();
+  low_disconnect(1);
 }
 
-protected void low_disconnect() {
+protected void low_disconnect(int _local, mixed|void backtrace) {
   if(conn->is_open()) {
     .DisconnectMessage message = .DisconnectMessage();
     send_message_sync(message);
     conn->close();
   }
-  reset_connection();
+  reset_connection(_local, backtrace);
   reset_state();
 }
 
@@ -208,14 +218,26 @@ void publish(string topic, string msg, int|void qos_level) {
   message->set_qos_level(qos_level);
   
   switch(qos_level) {
-    case 0:  // AT_MOST_ONCE
+    case .QOS_AT_MOST_ONCE:
       send_message(message);
       break;
-    case 1:  // AT_LEAST_ONCE
+    case .QOS_AT_LEAST_ONCE:
       message->message_identifier = get_message_identifier();
       .Message response = send_message_await_response(message, publish_response_timeout);
-      if(!response) throw(Error.Generic("Publish message (QOS=AT_LEAST_ONCE) was not acknowledged by server.\n"));
+      if(!response || object_program(response) != .PubAckMessage)
+        throw(Error.Generic("Publish message (QOS=AT_LEAST_ONCE) was not acknowledged by server.\n"));
       else { DEBUG("Got response for publish of message id %d\n", message->message_identifier); }
+      break;
+    case .QOS_EXACTLY_ONCE:  
+      message->message_identifier = get_message_identifier();
+      response = send_message_await_response(message, publish_response_timeout);
+      if(!response || object_program(response) != .PubRecMessage)
+        throw(Error.Generic("Publish message (QOS=EXACTLY_ONCE) was not acknowledged by server (phase 1).\n"));
+      .Message message2 = .PubRelMessage();
+      message2->message_identifier = response->message_identifier;
+      .Message response2 = send_message_await_response(message2, publish_response_timeout);
+      if(!response2 || object_program(response2) != .PubCompMessage)
+        throw(Error.Generic("Publish message (QOS=EXACTLY_ONCE) was not acknowledged by server (phase 2).\n"));
       break;
     default:
       throw(Error.Generic("Unsupported QOS Level: " + qos_level + "\n"));
@@ -308,35 +330,44 @@ protected .Message send_message_await_response(.Message m, int timeout) {
 
 protected .Message await_response(int message_identifier, int timeout) {
   .Message m = 0;
+  Pike.Backend orig;
+
   float f = (float)timeout;
   
   DEBUG("await_response %d\n", message_identifier);
   int was_locked;
-  
-  object key = await_mutex->trylock();
-  
+
   if(m = pending_responses[message_identifier])
     return m;
 
-  if(!key) {
-    key = await_mutex->lock();
-    if(m = pending_responses[message_identifier]) { 
-      key = 0;
-      return m;
-    }
-  }
-  Pike.Backend orig = conn->query_backend();
-  Pike.Backend b = Pike.Backend();
-  conn->set_backend(b);
+// TODO
+// there is a theoretical race condition here
+// or at least a possible performance gap that could occur if a
+// client is waiting and the lock is held while messages are not 
+// delivered. we should 
   while(f > 0.0) {
-    DEBUG("waiting for message %d\n", message_identifier);
-    f = f - b(f);
+    
+    object key = await_mutex->trylock();
+
+    if(!key) {
+      key = await_mutex->lock();
+      if(m = pending_responses[message_identifier]) { 
+        key = 0;
+        return m;
+      }
+    }
+
+    if(!orig) orig = conn->query_backend();
+
+    // DEBUG("waiting %f seconds for message %d\n", f, message_identifier);
+    conn->set_backend(await_backend);
+    f = f - await_backend(f);
+    key = 0;
     if((m = pending_responses[message_identifier])) 
       break;
   }
 
   conn->set_backend(orig);
-  key = 0;
   return m; // timeout
 }
 
@@ -364,8 +395,14 @@ protected int get_digit(Stdio.Buffer buf, int digit) {
 
 protected void send_ping() {
 	.PingMessage message = .PingMessage();
-	
+	ping_timeout_callout_ids->put(call_out(ping_timeout, timeout));
 	send_message(message);
+}
+
+protected void ping_timeout() {
+  // no ping response received before timeout.
+  DEBUG("No ping response received before timeout, disconnecting.\n");
+  disconnect();
 }
 
 protected void reset_state() {
@@ -377,30 +414,29 @@ protected void reset_state() {
   length_bytes = ({});
 }
 
-protected void reset_connection() {
+protected void reset_connection(void|int _local, mixed|void backtrace) {
     connection_state = NOT_CONNECTED;
     if(timeout_callout_id)
       remove_call_out(timeout_callout_id);
     if(disconnect_cb)
-	  disconnect_cb(this);
+	    disconnect_cb(this, .Reason(_local, backtrace));
 }
 
 protected int write_cb(mixed id) {
-  DEBUG("write_cb %O\n", id);
+//  DEBUG("write_cb %O\n", id);
   if(connect_url->scheme == "mqtts" && sizeof(outbuf))
   {
 	  string s = outbuf->read();
 	  int tosend = sizeof(s);
 	  int tot = 0;
-	  DEBUG("writing %d\n", sizeof(s));
+//	  DEBUG("writing %d\n", sizeof(s));
 	  while(tot < tosend) {
        int sent = conn->write(s);
 	   tot += sent;
 	   if(tot < tosend && sent > 0) s = s[sent..];
     }
-	  DEBUG("wrote %d\n", tot);
+//	  DEBUG("wrote %d\n", tot);
 	  return tot;
-  
   }
   return 0;
 }
@@ -416,19 +452,20 @@ protected void read_cb(mixed id, object data) {
   if(connect_url->scheme == "mqtts")
   {
     buf->add(data);
-	data = buf;
+	  data = buf;
   }
   
   mixed buf = data;
 
   while(sizeof(buf)) {
+  DEBUG("Have data in buffer.\n");
   
   if(!packet_started)
   {
      packet_started = 1;
      current_header = buf->read_int8();
      DEBUG("header: %d\n", current_header);     
-     if(!sizeof(buf)) return 0;
+     if(!sizeof(buf)) { DEBUG("No more data after header byte\n"); return 0; }
   }
   
   if(!have_length) {
@@ -436,6 +473,8 @@ protected void read_cb(mixed id, object data) {
      int multiplier = 1;
      int value = 0;
      int digit;
+     
+     DEBUG("getting length\n");
      
      do {
         digit = get_digit(buf, t);
@@ -450,8 +489,15 @@ protected void read_cb(mixed id, object data) {
       current_length = value;
   }
   
+  if(have_length)
+    DEBUG("Expecting packet length of %d\n", current_length);
+  else DEBUG("Didn't get full length from packet. Will wait for more data.");
+  
   int len = sizeof(buf);
-  if(!len || len < current_length) return 0;
+  
+  if(len && !have_length) { throw(Error.Generic("Didn't calculate length but have data in buffer. Algorithm bug?\n")); }
+  
+  if(len < current_length) return 0;
   
   string body = buf->read(current_length);
   int h = current_header;
@@ -478,11 +524,20 @@ protected void process_message(.Message message) {
     if(has_index(pending_responses, message_identifier)) pending_responses[message_identifier] = message;
   }
   
+  if(object_program(message) == .PingResponseMessage) {
+    // TODO what if we have multiple outstanding ping responses? Should we keep a stack of timeouts?
+    DEBUG("Got PingResponse\n");
+    if(sizeof(ping_timeout_callout_ids)) {
+      DEBUG("removing ping timeout callout\n");
+      remove_call_out(ping_timeout_callout_ids->get());
+    }
+  }
+  
   if(object_program(message) == .ConnAckMessage) {
     if(connection_state != CONNECTING) 
       throw(Error.Generic("Received CONNACK at invalid point, disconnecting.\n"));
     if(message->response_code != 0) {
-      low_disconnect();
+      low_disconnect(1);
       throw(Error.Generic(sprintf("Server reports connection failed with code %d: %s.\n", message->response_code, message->response_text)));
     }
     connection_state = CONNECTED;
@@ -497,14 +552,13 @@ protected void process_message(.Message message) {
 	  DEBUG("PublishMessage topic: %s (qos=%d), %O\n", message->topic, qos, message->body);
 	  if((cbs = publish_callbacks[message->topic])) {
 		  switch(qos) {
-		    case 0:
+		    case .QOS_AT_MOST_ONCE:
     		  foreach(cbs; function callback;) {
     		    DEBUG("Scheduling delivery of message from %s to %O\n", message->topic, callback);
 		  	    call_out(callback, 0, this, message->topic, message->body);
 		  	  }
 		      break;
-		    case 1:
-	      case 2: // TODO properly support QOS EXACTLY_ONCE
+		    case .QOS_AT_LEAST_ONCE:
 	        int have_errors = 0;
 				  foreach(cbs; function callback;) {
     		    DEBUG("Performing delivery of message from %s to %O\n", message->topic, callback);
@@ -520,19 +574,35 @@ protected void process_message(.Message message) {
 		        werror("One or more callbacks to an AT_LEAST_ONCE publish message failed. Not acknowledging, duplicates may occur.\n");
 		      }
 	        break;
-		    }
-		
+	      case .QOS_EXACTLY_ONCE:
+          int message_identifier = message->message_identifier;
+          .Message message2 = .PubRecMessage();
+          message2->message_identifier = message_identifier;
+          .Message response = send_message_await_response(message2, publish_response_timeout);
+          if(!response || object_program(response) != .PubRelMessage)
+            throw(Error.Generic("Publish message (QOS=EXACTLY_ONCE) was not acknowledged by server (phase 1).\n"));
+          .Message message3 = .PubCompMessage();
+          message3->message_identifier = response->message_identifier;
+          send_message(message3);
+          
+          foreach(cbs; function callback;) {
+    		    DEBUG("Scheduling delivery of message from %s to %O\n", message->topic, callback);
+		  	    call_out(callback, 0, this, message->topic, message->body);
+		  	  }
+	    }
 	  }
 	  else {
    	    DEBUG("WARNING: got publish message for something we have no record of subscribing to: " + message->topic + "\n");
 	  }
   }
-  
   else if(object_program(message) == .SubscribeAckMessage) {
       DEBUG("%O subscribe got response code: %O\n", this, message->response_code);
   }
   else if(object_program(message) == .UnsubscribeAckMessage) {
       DEBUG("%O unsubscribe got response\n", this);
+  }
+  else {
+     DEBUG("%O message %O\n", this, message);
   }
 
 }

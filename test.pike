@@ -1,7 +1,6 @@
 
 object p;
 
-
 int main() {
 
   p = Public.Protocols.MQTT.client("mqtts://37.187.106.16");
@@ -14,12 +13,11 @@ int main() {
 
 }
 
-
 void has_connected(object client) {
 	werror("Client connected: %O\n", client);
-	client->set_qos_level(1);
+	client->set_qos_level(2);
 	client->subscribe("hww3/test", pub_cb);
-	client->publish("hww3/test", "client_connect", 1);
+	client->publish("hww3/test", "client_connect" * 20, 2);
 }
 
 int c = 0;
@@ -33,6 +31,6 @@ void pub_cb(object client, string topic, string body) {
   }
 }
 
-void dis_cb(object client) {
-	werror("Client disconnected: %O\n", client);
+void dis_cb(object client, object reason) {
+	werror("Client disconnected: %O=>%O\n", client, reason);
 }

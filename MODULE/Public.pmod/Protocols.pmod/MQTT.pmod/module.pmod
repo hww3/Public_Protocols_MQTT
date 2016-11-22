@@ -11,6 +11,8 @@ mapping message_registry = ([]);
 #define DEBUG(X ...)
 #endif /* MQTT_DEBUG */
 
+//! MQTT v3.1 support
+
 protected void create() {
   message_registry[.ConnectMessage.MESSAGE_NUMBER] = .ConnectMessage; 
   message_registry[.ConnAckMessage.MESSAGE_NUMBER] = .ConnAckMessage; 
