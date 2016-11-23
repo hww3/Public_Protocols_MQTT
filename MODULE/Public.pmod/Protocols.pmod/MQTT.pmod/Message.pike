@@ -17,6 +17,7 @@ protected int(0..1) retain_flag = 0;
 
 protected void create() { throw(Error.Generic("Creation not allowed\n")); }
 
+void set_dup_flag() { dup_flag = 1; }
 int get_qos_level() { return qos_level; }
 
 void decode(int header, Stdio.Buffer body) {

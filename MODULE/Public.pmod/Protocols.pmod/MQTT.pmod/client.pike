@@ -10,7 +10,7 @@ protected int port;
 protected string username;
 protected string password;
 
-protected Stdio.Buffer buf;
+protected Stdio.Buffer buffer;
 protected Stdio.Buffer outbuf;
 protected Pike.Backend backend;
 protected Pike.Backend await_backend = Pike.Backend();
@@ -32,9 +32,9 @@ protected function(.client,.Reason:void) disconnect_cb;
 protected mixed timeout_callout_id;
 
 protected int(0..2) qos_level = 0;
-protected int response_timeout = 5;
-protected int publish_response_timeout = 5;
-protected int max_retries = 1;
+protected int response_timeout = 30;
+protected int publish_response_timeout = 30;
+protected int max_retries = 3;
 
 mapping(string:multiset) publish_callbacks = ([]);
 
@@ -137,13 +137,13 @@ variant void connect() {
 	   conn->set_blocking();
 	   if(!conn->connect(host))
 	     throw(Error.Generic("Unable to start TLS session with MQTT server.\n"));
-	   conn->write("");
+	   //conn->write("");
    }
 
-   buf = Stdio.Buffer();
+   buffer = Stdio.Buffer();
    outbuf = Stdio.Buffer();
    if(connect_url->scheme != "mqtts")
-     conn->set_buffer_mode(buf, outbuf);
+     conn->set_buffer_mode(buffer, outbuf);
    conn->set_write_callback(write_cb);
    conn->set_close_callback(close_cb);
    conn->set_read_callback(read_cb);
@@ -207,19 +207,110 @@ protected void low_disconnect(int _local, mixed|void backtrace) {
   reset_state();
 }
 
+//! publish a message and return immediately. 
 //!
-void publish(string topic, string msg, int|void qos_level) {
+//! @note
+//!   all I/O performed by this message happens in the backend, so any code that calls 
+//!   this method must return to the backend before any work is done.
+void publish(string topic, string msg, int|void qos_level, function failure_cb) {
   check_connected();  
   
   .PublishMessage message = .PublishMessage();
   message->topic = topic;
-  message->message_identifier = get_message_identifier();
   message->body = msg;
   message->set_qos_level(qos_level);
   
   switch(qos_level) {
     case .QOS_AT_MOST_ONCE:
       send_message(message);
+      break;
+    case .QOS_AT_LEAST_ONCE:
+      message->message_identifier = get_message_identifier();
+      
+      send_message(message);
+      async_await_response(message->message_identifier, message, publish_response_timeout, max_retries,
+        publish_ack_cb, publish_ack_timeout_cb, (["failure": failure_cb]));
+      
+      break;
+    case .QOS_EXACTLY_ONCE:  
+      mapping data = (["failure": failure_cb]); // for storing callbacks later.
+      message->message_identifier = get_message_identifier();
+      send_message(message);
+      async_await_response(message->message_identifier, message, publish_response_timeout, max_retries, 
+        publish_rec_cb, publish_rec_timeout_cb, data);
+      break;
+    default:
+      throw(Error.Generic("Unsupported QOS Level: " + qos_level + "\n"));
+  }
+}
+
+protected void publish_ack_cb(.PendingResponse r) { 
+          DEBUG("Got response for publish of message id %d\n", r->original_message->message_identifier);
+          if(r->data->success) r->data->success(r->original_message);
+}
+
+protected void publish_ack_timeout_cb(.PendingResponse r) { 
+          throw(Error.Generic(sprintf("Publish message %d (QOS=AT_LEAST_ONCE) was not acknowledged by server.\n", r->original_message->message_identifier)));
+          if(r->data->failure) r->data->failure(r->original_message);
+}
+
+protected void publish_rec_cb(.PendingResponse r) { 
+          DEBUG("Got response for publish (phase 1) of message id %d\n", r->original_message->message_identifier);
+          if(object_program(r->message) != .PubRecMessage) {
+            DEBUG("Got invalid response for publish (phase 1) of message id %d\n", r->original_message->message_identifier);
+            // TODO failure callback
+            if(r->data->failure) r->data->failure(r->original_message);
+          }
+          else {
+            .Message message2 = .PubRelMessage();
+            message2->message_identifier = r->message_identifier;
+            send_message(message2);
+            async_await_response(message2->message_identifier, message2, publish_response_timeout, max_retries,
+              publish_comp_cb, publish_comp_timeout_cb, (["failure": r->data->failure, "success": r->data->success, "original_message": r->original_message]));
+          }
+}
+
+protected void publish_rec_timeout_cb(.PendingResponse r) { 
+          throw(Error.Generic(sprintf("Publish message %d (QOS=AT_EXACTLY_ONCE, phase 1) was not acknowledged by server.\n", r->original_message->message_identifier)));
+            // TODO failure callback
+            if(r->data->failure) r->data->failure(r->original_message);
+}
+
+protected void publish_comp_cb(.PendingResponse r) { 
+          DEBUG("Got response for publish (phase 2) of message id %d\n", r->original_message->message_identifier);
+          if(object_program(r->message) != .PubCompMessage) {
+            DEBUG("Got invalid response for publish (phase 2) of message id %d\n", r->original_message->message_identifier);
+            // TODO failure callback
+            if(r->data->failure) r->data->failure(r->data->original_message);
+          }
+          else {
+            DEBUG("Got response for publish of message id %d\n", r->original_message->message_identifier);
+            if(r->data->success) r->data->success(r->data->original_message);
+          }
+}
+
+protected void publish_comp_timeout_cb(.PendingResponse r) { 
+          throw(Error.Generic(sprintf("Publish message %d (QOS=AT_EXACTLY_ONCE, phase 2) was not acknowledged by server.\n", r->original_message->message_identifier)));
+            // TODO failure callback
+            if(r->data->failure) r->data->failure(r->data->original_message);
+}
+
+
+//! publish a message synchronously and if QOS level requires a response, wait before returning.
+//! 
+//! @note
+//!   synchronous publishing is far slower than asynchnronous publishing using @[publish]. 
+void publish_sync(string topic, string msg, int|void qos_level) {
+  check_connected();  
+  
+  .PublishMessage message = .PublishMessage();
+  message->topic = topic;
+  message->body = msg;
+  message->set_qos_level(qos_level);
+  
+  switch(qos_level) {
+    case .QOS_AT_MOST_ONCE:
+      send_message_sync(message);
       break;
     case .QOS_AT_LEAST_ONCE:
       message->message_identifier = get_message_identifier();
@@ -286,7 +377,7 @@ protected int get_message_identifier() {
 	return ++message_identifier;
 }
 
-protected void send_message(.Message m) {
+void send_message(.Message m) {
    string msg = m->encode();  
    DEBUG("Adding outbound message to queue: %O => %O\n", m, msg);
    outbuf->add(msg);
@@ -308,6 +399,11 @@ protected void send_message_sync(.Message m) {
    timeout_callout_id = call_out(send_ping, (timeout > 1? timeout - 1: 0.5));
 }
 
+protected void async_await_response(int message_identifier, .Message message, int response_timeout, 
+    int max_retries, function success, function failure, mixed data) {
+    register_pending(message_identifier, message, response_timeout, max_retries, success, failure, data);
+}
+
 protected .Message send_message_await_response(.Message m, int timeout) {
   .Message r = 0;
   int message_identifier = m->message_identifier;
@@ -315,12 +411,12 @@ protected .Message send_message_await_response(.Message m, int timeout) {
   if(!message_identifier) throw(Error.Generic("No message identifier specified. Cannot receive a response.\n"));
   int attempts = 0;
 
-  register_pending(message_identifier);
+  register_pending(message_identifier, m);
   do {
     send_message(m);
     r = await_response(message_identifier, timeout);
     if(r) break;
-    m->dup_flag = 1;
+    m->set_dup_flag();
   }  while(attempts++ < max_retries);
 
   unregister_pending(message_identifier);
@@ -335,10 +431,9 @@ protected .Message await_response(int message_identifier, int timeout) {
   float f = (float)timeout;
   
   DEBUG("await_response %d\n", message_identifier);
-  int was_locked;
 
-  if(m = pending_responses[message_identifier])
-    return m;
+  if((m = pending_responses[message_identifier])  && m->message)
+    return m->message;
 
 // TODO
 // there is a theoretical race condition here
@@ -351,9 +446,9 @@ protected .Message await_response(int message_identifier, int timeout) {
 
     if(!key) {
       key = await_mutex->lock();
-      if(m = pending_responses[message_identifier]) { 
+      if((m = pending_responses[message_identifier]) && m->message) { 
         key = 0;
-        return m;
+        return m->message;
       }
     }
 
@@ -363,19 +458,29 @@ protected .Message await_response(int message_identifier, int timeout) {
     conn->set_backend(await_backend);
     f = f - await_backend(f);
     key = 0;
-    if((m = pending_responses[message_identifier])) 
+    if((m = pending_responses[message_identifier]) && m->message) 
       break;
   }
 
   conn->set_backend(orig);
-  return m; // timeout
+  return m?m->message:m; // timeout
 }
 
-protected void register_pending(int message_identifier) {
-  pending_responses[message_identifier] = 0;
+protected variant void register_pending(int message_identifier, .Message message) {
+  .PendingResponse pr = .PendingResponse(this, message_identifier, message, 0, 0);
+  pending_responses[message_identifier] = pr;
 }
 
-protected void unregister_pending(int message_identifier) {
+protected variant void register_pending(int message_identifier, .Message message,  int timeout, int max_retries, function success, function failure, mixed data) {
+  .PendingResponse pr = .PendingResponse(this, message_identifier, message, timeout, max_retries);
+  if(data) pr->data = data;
+  if(success) pr->success = success;
+  if(failure) pr->failure = failure;
+    else pr->failure = report_timeout;
+  pending_responses[message_identifier] = pr;
+}
+
+void unregister_pending(int message_identifier) {
   if(has_index(pending_responses, message_identifier)) {
     DEBUG("clearing pending response marker for %d\n", message_identifier);
     m_delete(pending_responses, message_identifier);
@@ -383,6 +488,11 @@ protected void unregister_pending(int message_identifier) {
 }
 
 protected int get_digit(Stdio.Buffer buf, int digit) {
+int d = _get_digit(buf, digit);
+  //werror("digit: %O\n", d);
+  return d;
+}
+protected int _get_digit(Stdio.Buffer buf, int digit) {
   if(sizeof(length_bytes) > digit)
     return length_bytes[digit];
   else {
@@ -449,23 +559,22 @@ protected void close_cb(mixed id) {
 
 protected void read_cb(mixed id, object data) {
   DEBUG("read_cb: %O %O\n", id, data);
+  mixed buf = buffer;
+
   if(connect_url->scheme == "mqtts")
   {
     buf->add(data);
 	  data = buf;
   }
   
-  mixed buf = data;
-
-  while(sizeof(buf)) {
-  DEBUG("Have data in buffer.\n");
-  
   if(!packet_started)
   {
+     if(!sizeof(buf)) return;
      packet_started = 1;
      current_header = buf->read_int8();
-     DEBUG("header: %d\n", current_header);     
-     if(!sizeof(buf)) { DEBUG("No more data after header byte\n"); return 0; }
+ //    werror("header: %O\n", current_header);     
+     if(!sizeof(buf)) {// werror("No more data after header byte\n"); 
+     return 0; }
   }
   
   if(!have_length) {
@@ -474,7 +583,7 @@ protected void read_cb(mixed id, object data) {
      int value = 0;
      int digit;
      
-     DEBUG("getting length\n");
+  //   werror("getting length\n");
      
      do {
         digit = get_digit(buf, t);
@@ -492,37 +601,47 @@ protected void read_cb(mixed id, object data) {
   if(have_length)
     DEBUG("Expecting packet length of %d\n", current_length);
   else DEBUG("Didn't get full length from packet. Will wait for more data.");
+
+    int h = current_header;
   
   int len = sizeof(buf);
+  int message_type = (h >> 4) & 15;  
   
   if(len && !have_length) { throw(Error.Generic("Didn't calculate length but have data in buffer. Algorithm bug?\n")); }
   
   if(len < current_length) return 0;
   
   string body = buf->read(current_length);
-  int h = current_header;
-  
+
+  werror("Data? header: %O, message_type: %O, length: %O body: %O, remaining: %O\n", h, message_type, current_length, body, sizeof(buf));
   reset_state();
   
-  int message_type = (h >> 4) & 15;  
 
   program mt = Public.Protocols.MQTT.message_registry[message_type];
-  if(!mt) throw(Error.Generic("No message type registred for " + message_type + ".\n"));
-  
+  if(!mt){ 
+    werror("Bad data? header: %O, length: %O body: %O, remaining: %O\n", h, current_length, body, sizeof(buf));
+    throw(Error.Generic("No message type registered for " + message_type + ".\n"));
+  }
   .Message message = mt();
   message->decode(h, Stdio.Buffer(body));
   
   process_message(message);
-}
+  
+  if(sizeof(buf)) {// data left, so queue up another round.
+  DEBUG("have %d in buffer\n", sizeof(buf));
+    call_out(read_cb, 0, id, "");
+    }
+    else DEBUG("buffer empty.\n");
 }
 
+ void report_timeout(.PendingResponse response) {
+   DEBUG("A timed out waiting for response after %d attempts.\n", response->attempts);
+ }
+
 protected void process_message(.Message message) {
-  DEBUG("got message: %O\n", message);
+  werror("got message: %O\n", message);
   int message_identifier = message->message_identifier;
-  if(message_identifier) {
-    DEBUG("Got a message with a message_identifier: %d\n", message_identifier);
-    if(has_index(pending_responses, message_identifier)) pending_responses[message_identifier] = message;
-  }
+
   
   if(object_program(message) == .PingResponseMessage) {
     // TODO what if we have multiple outstanding ping responses? Should we keep a stack of timeouts?
@@ -533,7 +652,7 @@ protected void process_message(.Message message) {
     }
   }
   
-  if(object_program(message) == .ConnAckMessage) {
+  else if(object_program(message) == .ConnAckMessage) {
     if(connection_state != CONNECTING) 
       throw(Error.Generic("Received CONNACK at invalid point, disconnecting.\n"));
     if(message->response_code != 0) {
@@ -578,33 +697,68 @@ protected void process_message(.Message message) {
           int message_identifier = message->message_identifier;
           .Message message2 = .PubRecMessage();
           message2->message_identifier = message_identifier;
-          .Message response = send_message_await_response(message2, publish_response_timeout);
-          if(!response || object_program(response) != .PubRelMessage)
-            throw(Error.Generic("Publish message (QOS=EXACTLY_ONCE) was not acknowledged by server (phase 1).\n"));
-          .Message message3 = .PubCompMessage();
-          message3->message_identifier = response->message_identifier;
-          send_message(message3);
-          
-          foreach(cbs; function callback;) {
-    		    DEBUG("Scheduling delivery of message from %s to %O\n", message->topic, callback);
-		  	    call_out(callback, 0, this, message->topic, message->body);
-		  	  }
+          send_message(message2);
+          mapping data = (["message": message]); // for storing callbacks later.
+          async_await_response(message2->message_identifier, message2, publish_response_timeout, max_retries, 
+            publish_rel_cb, publish_rel_timeout_cb, data);
 	    }
 	  }
 	  else {
    	    DEBUG("WARNING: got publish message for something we have no record of subscribing to: " + message->topic + "\n");
 	  }
   }
-  else if(object_program(message) == .SubscribeAckMessage) {
-      DEBUG("%O subscribe got response code: %O\n", this, message->response_code);
-  }
-  else if(object_program(message) == .UnsubscribeAckMessage) {
-      DEBUG("%O unsubscribe got response\n", this);
+  else if(message_identifier) {
+    DEBUG("Got a message with a message_identifier: %d %O\n", message_identifier, message);
+    if(has_index(pending_responses, message_identifier)) {
+      object pending_response = pending_responses[message_identifier];
+      pending_response->received_message(message);
+    } else  {
+      DEBUG("Not waiting for an answer for id=%d\n", message_identifier);
+      if(object_program(message) == .PubRelMessage) {
+        // could be a resend. since we got here, we have already processed it, so we just need to keep replying back.
+        .Message reply = .PubCompMessage();
+        reply->message_identifier = message_identifier;
+        send_message(reply);
+      }
+      else if(object_program(message) == .SubscribeAckMessage) {
+        DEBUG("%O unhandled subscribe ack with response code: %O\n", this, message->response_code);
+      }
+      else if(object_program(message) == .UnsubscribeAckMessage) {
+        DEBUG("%O unhandled unsubscribe ack response\n", this);
+      }
+    }
   }
   else {
-     DEBUG("%O message %O\n", this, message);
+     DEBUG("%O unhandled message %O\n", this, message);
   }
 
+}
+
+protected void publish_rel_cb(.PendingResponse r) { 
+          DEBUG("Got response for publish (phase 2) of message id %d: %O\n", r->original_message->message_identifier, r->message);
+          if(object_program(r->message) != .PubRelMessage) {
+            DEBUG("Got invalid response for publish (phase 2) of message id %d\n", r->original_message->message_identifier);
+            // TODO failure callback
+            if(r->data->failure) r->data->failure(r->original_message);
+          }
+          else {
+            .Message message2 = .PubCompMessage();
+            message2->message_identifier = r->message_identifier;
+            send_message(message2);
+            .Message message = r->data->message;
+            mixed cbs = publish_callbacks[message->topic];
+            foreach(cbs; function callback;) {
+      		    DEBUG("Scheduling delivery of message from %s to %O\n", message->topic, callback);
+	  	  	    call_out(callback, 0, this, message->topic, message->body);
+  		  	  }
+
+          }
+}
+
+protected void publish_rel_timeout_cb(.PendingResponse r) { 
+          throw(Error.Generic(sprintf("Publish message %d (QOS=AT_EXACTLY_ONCE, phase 2) was not acknowledged by server.\n", r->original_message->message_identifier)));
+            // TODO failure callback
+            if(r->data->failure) r->data->failure(r->original_message);
 }
 
 protected void report_error(mixed error) {
