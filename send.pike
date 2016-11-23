@@ -18,7 +18,7 @@ void has_connected(object client) {
 	werror("Client connected: %O\n", client);
 	client->set_qos_level(2);
 	// client->subscribe("hww3/test", pub_cb);
-	for(int i = 0; i < 200; i++) call_out(client->publish, 0, "hww3/test", "client_connect" + i, 1);
+	for(int i = 0; i < 200; i++) call_out(client->publish, 0, "hww3/test", "client_connect" + i, 2);
 //	call_out(has_connected, 0, client);
 }
 
