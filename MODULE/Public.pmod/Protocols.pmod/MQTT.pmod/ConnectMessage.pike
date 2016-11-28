@@ -31,7 +31,7 @@ void decode_body(Stdio.Buffer body) {
   
   protocol_version = read_byte(body);
   int flags = read_byte(body);
-  
+  keep_alive = read_word(body);
   clean_session = (flags >> 1) & 1;
   will_flag = (flags >> 2) & 1;
   will_qos = (flags >> 4) & 3;

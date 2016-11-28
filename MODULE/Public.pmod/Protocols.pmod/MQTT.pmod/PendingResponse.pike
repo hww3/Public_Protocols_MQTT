@@ -14,10 +14,10 @@ int timeout;
 int timeout_timestamp;
 int attempts;
 int max_retries;
-.client client;
+object client;
 mixed data;
 
-protected void create(.client client, int message_identifier, .Message orig, int timeout, int max_retries) {
+protected void create(object client, int message_identifier, .Message orig, int timeout, int max_retries) {
   this.client = client;
   this.message_identifier = message_identifier;
   this.original_message = orig;

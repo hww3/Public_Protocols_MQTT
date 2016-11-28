@@ -13,6 +13,8 @@ protected string password;
 
 protected Standards.URI connect_url;
 
+protected function(.client:void) connect_cb;
+protected function(.client,.Reason:void) disconnect_cb;
 mapping(string:multiset) publish_callbacks = ([]);
 
 //! MQTT client
@@ -100,6 +102,11 @@ variant void connect() {
    }
    
    send_message(m);
+}
+
+//!
+void set_disconnect_callback(function(.client,.Reason:void) cb) {
+	disconnect_cb = cb;
 }
 
 //! publish a message and return immediately. 
@@ -262,6 +269,30 @@ void unsubscribe(string topic, function(.client,string,string:void) publish_cb) 
 	}
 }
 
+protected void send_ping() {
+	.PingMessage message = .PingMessage();
+	ping_timeout_callout_ids->put(call_out(ping_timeout, timeout));
+	send_message(message);
+}
+
+protected void ping_timeout() {
+  // no ping response received before timeout.
+  DEBUG("No ping response received before timeout, disconnecting.\n");
+  disconnect();
+}
+
+void send_message(.Message m) {
+   ::send_message(m);
+   if(timeout_callout_id) remove_call_out(timeout_callout_id);
+   timeout_callout_id = call_out(send_ping, (timeout > 1? timeout - 1: 0.5));
+}
+
+protected void send_message_sync(.Message m) {
+   ::send_message_sync(m);
+   if(timeout_callout_id) remove_call_out(timeout_callout_id);
+   timeout_callout_id = call_out(send_ping, (timeout > 1? timeout - 1: 0.5));
+}
+
 protected void process_message(.Message message) {
   werror("got message: %O\n", message);
   int message_identifier = message->message_identifier;
@@ -390,6 +421,12 @@ void acknowledge_pub(.Message message) {
    send_message(response);
 }
   
+  protected void reset_connection(void|int _local, mixed|void backtrace) {
+    ::reset_connection();
+    if(disconnect_cb)
+	    disconnect_cb(this, .Reason(_local, backtrace));
+}
+
 protected string _sprintf(mixed t) {
 	  return "MQTT.client(" + (string)connect_url + "=>" + CONNECT_STATES[connection_state] + ")";
 }

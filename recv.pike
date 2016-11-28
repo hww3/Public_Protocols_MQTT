@@ -3,7 +3,7 @@ object p;
 
 int main() {
 
-  p = Public.Protocols.MQTT.client("mqtt://localhost");
+  p = Public.Protocols.MQTT.client("mqtt://127.0.0.1");
   p->set_client_identifier("hww3-" + time());
   p->set_disconnect_callback(dis_cb);
   werror("Client: %O\n", p);

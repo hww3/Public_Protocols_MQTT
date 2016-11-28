@@ -23,8 +23,7 @@ protected int connection_state = NOT_CONNECTED;
 protected SSL.Context ssl_context;
 protected string client_identifier;
 protected int timeout = 10;
-protected function(.client:void) connect_cb;
-protected function(.client,.Reason:void) disconnect_cb;
+
 protected mixed timeout_callout_id;
 
 protected int(0..2) qos_level = 0;
@@ -70,12 +69,6 @@ void set_response_timeout(int secs) {
 //! number of times to retry transmission for requests whose acknowledgements have timed out
 void set_retry_attempts(int count) {
   max_retries = count;
-}
-
-
-//!
-void set_disconnect_callback(function(.client,.Reason:void) cb) {
-	disconnect_cb = cb;
 }
 
 //! 
@@ -130,9 +123,6 @@ void send_message(.Message m) {
    
    if(conn->query_application_protocol)
 	   conn->write("");
-   
-   if(timeout_callout_id) remove_call_out(timeout_callout_id);
-   timeout_callout_id = call_out(send_ping, (timeout > 1? timeout - 1: 0.5));
 }
 
 protected void send_message_sync(.Message m) {
@@ -141,8 +131,6 @@ protected void send_message_sync(.Message m) {
    conn->set_blocking_keep_callbacks();
    conn->write(msg);
    conn->set_nonblocking_keep_callbacks();
-   if(timeout_callout_id) remove_call_out(timeout_callout_id);
-   timeout_callout_id = call_out(send_ping, (timeout > 1? timeout - 1: 0.5));
 }
 
 protected void async_await_response(int message_identifier, .Message message, int response_timeout, 
@@ -242,18 +230,6 @@ protected int get_digit(Stdio.Buffer buf, int digit) {
     length_bytes += ({ val });
     return val;
   }
-}
-
-protected void send_ping() {
-	.PingMessage message = .PingMessage();
-	ping_timeout_callout_ids->put(call_out(ping_timeout, timeout));
-	send_message(message);
-}
-
-protected void ping_timeout() {
-  // no ping response received before timeout.
-  DEBUG("No ping response received before timeout, disconnecting.\n");
-  disconnect();
 }
 
 protected int write_cb(mixed id) {
@@ -377,8 +353,6 @@ protected void reset_connection(void|int _local, mixed|void backtrace) {
     connection_state = NOT_CONNECTED;
     if(timeout_callout_id)
       remove_call_out(timeout_callout_id);
-    if(disconnect_cb)
-	    disconnect_cb(this, .Reason(_local, backtrace));
 }
 
 protected void report_error(mixed error) {

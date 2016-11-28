@@ -20,6 +20,11 @@ void decode_body(Stdio.Buffer body) {
   
 }
 
+void encode_variable_header(Stdio.Buffer buf) { 
+  encode_byte(buf, compression_flags);
+  encode_byte(buf, response_code);
+}
+
 protected mapping response_texts = ([
 0x00: "Connection Accepted",
 0x01: "Connection Refused: unacceptable protocol version",
