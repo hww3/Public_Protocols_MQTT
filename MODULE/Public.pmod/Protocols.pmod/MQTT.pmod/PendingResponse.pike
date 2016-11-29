@@ -50,6 +50,10 @@ werror("Timed out waiting for response to message_identifier=%d, resending\n", m
   
 }
 
+void destroy() {
+  if(timeout_callout_id) remove_call_out(timeout_callout_id);
+}
+
 void received_message(.Message message) {
   this.message = message;
   if(timeout_callout_id) remove_call_out(timeout_callout_id);

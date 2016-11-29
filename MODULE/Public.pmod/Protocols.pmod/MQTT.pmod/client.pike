@@ -42,11 +42,20 @@ protected variant void create(string _connect_url) {
 	password = connect_url->password;
 	
 	if(!port) {
-		if(connect_url->scheme == "mqtts") port = 8883;
-		else port = 1883;
+		if(connect_url->scheme == "mqtts") port = MQTTS_PORT;
+		else port = MQTT_PORT;
 	}
 	
 	backend = Pike.DefaultBackend;
+}
+
+//!
+void set_will_and_testament(string topic, string(7bit) message, int(0..2) qos) {
+  if(is_connected()) throw(Error.Generic("will and testament must be provided before connecting.\n"));
+  if(!(topic && message)) throw(Error.Generic("Both will topic and message must be provided.\n"));
+   will_topic = topic;
+   will_message = message;
+   will_qos = qos;
 }
 
 //!
@@ -100,6 +109,11 @@ variant void connect() {
   	     m->password = password;
 	   }
    }
+   if(will_topic) {
+     m->will_flag = 1;
+     m->will_topic = will_topic;
+     m->will_message = will_message;
+   }
    
    send_message(m);
 }
@@ -107,94 +121,6 @@ variant void connect() {
 //!
 void set_disconnect_callback(function(.client,.Reason:void) cb) {
 	disconnect_cb = cb;
-}
-
-//! publish a message and return immediately. 
-//!
-//! @note
-//!   all I/O performed by this message happens in the backend, so any code that calls 
-//!   this method must return to the backend before any work is done.
-void publish(string topic, string msg, int|void qos_level, function failure_cb) {
-  check_connected();  
-  
-  .PublishMessage message = .PublishMessage();
-  message->topic = topic;
-  message->body = msg;
-  message->set_qos_level(qos_level);
-  
-  switch(qos_level) {
-    case .QOS_AT_MOST_ONCE:
-      send_message(message);
-      break;
-    case .QOS_AT_LEAST_ONCE:
-      message->message_identifier = get_message_identifier();
-      
-      send_message(message);
-      async_await_response(message->message_identifier, message, publish_response_timeout, max_retries,
-        publish_ack_cb, publish_ack_timeout_cb, (["failure": failure_cb]));
-      
-      break;
-    case .QOS_EXACTLY_ONCE:  
-      mapping data = (["failure": failure_cb]); // for storing callbacks later.
-      message->message_identifier = get_message_identifier();
-      send_message(message);
-      async_await_response(message->message_identifier, message, publish_response_timeout, max_retries, 
-        publish_rec_cb, publish_rec_timeout_cb, data);
-      break;
-    default:
-      throw(Error.Generic("Unsupported QOS Level: " + qos_level + "\n"));
-  }
-}
-
-protected void publish_ack_cb(.PendingResponse r) { 
-          DEBUG("Got response for publish of message id %d\n", r->original_message->message_identifier);
-          if(r->data->success) r->data->success(r->original_message);
-}
-
-protected void publish_ack_timeout_cb(.PendingResponse r) { 
-          throw(Error.Generic(sprintf("Publish message %d (QOS=AT_LEAST_ONCE) was not acknowledged by server.\n", r->original_message->message_identifier)));
-          if(r->data->failure) r->data->failure(r->original_message);
-}
-
-protected void publish_rec_cb(.PendingResponse r) { 
-          DEBUG("Got response for publish (phase 1) of message id %d\n", r->original_message->message_identifier);
-          if(object_program(r->message) != .PubRecMessage) {
-            DEBUG("Got invalid response for publish (phase 1) of message id %d\n", r->original_message->message_identifier);
-            // TODO failure callback
-            if(r->data->failure) r->data->failure(r->original_message);
-          }
-          else {
-            .Message message2 = .PubRelMessage();
-            message2->message_identifier = r->message_identifier;
-            send_message(message2);
-            async_await_response(message2->message_identifier, message2, publish_response_timeout, max_retries,
-              publish_comp_cb, publish_comp_timeout_cb, (["failure": r->data->failure, "success": r->data->success, "original_message": r->original_message]));
-          }
-}
-
-protected void publish_rec_timeout_cb(.PendingResponse r) { 
-          throw(Error.Generic(sprintf("Publish message %d (QOS=AT_EXACTLY_ONCE, phase 1) was not acknowledged by server.\n", r->original_message->message_identifier)));
-            // TODO failure callback
-            if(r->data->failure) r->data->failure(r->original_message);
-}
-
-protected void publish_comp_cb(.PendingResponse r) { 
-          DEBUG("Got response for publish (phase 2) of message id %d\n", r->original_message->message_identifier);
-          if(object_program(r->message) != .PubCompMessage) {
-            DEBUG("Got invalid response for publish (phase 2) of message id %d\n", r->original_message->message_identifier);
-            // TODO failure callback
-            if(r->data->failure) r->data->failure(r->data->original_message);
-          }
-          else {
-            DEBUG("Got response for publish of message id %d\n", r->original_message->message_identifier);
-            if(r->data->success) r->data->success(r->data->original_message);
-          }
-}
-
-protected void publish_comp_timeout_cb(.PendingResponse r) { 
-          throw(Error.Generic(sprintf("Publish message %d (QOS=AT_EXACTLY_ONCE, phase 2) was not acknowledged by server.\n", r->original_message->message_identifier)));
-            // TODO failure callback
-            if(r->data->failure) r->data->failure(r->data->original_message);
 }
 
 //! publish a message synchronously and if QOS level requires a response, wait before returning.
@@ -294,7 +220,7 @@ protected void send_message_sync(.Message m) {
 }
 
 protected void process_message(.Message message) {
-  werror("got message: %O\n", message);
+  DEBUG("got message: %O\n", message);
   int message_identifier = message->message_identifier;
 
   if(object_program(message) == .PingResponseMessage) {
@@ -305,7 +231,6 @@ protected void process_message(.Message message) {
       remove_call_out(ping_timeout_callout_ids->get());
     }
   }
-  
   else if(object_program(message) == .ConnAckMessage) {
     if(connection_state != CONNECTING) 
       throw(Error.Generic("Received CONNACK at invalid point, disconnecting.\n"));
@@ -317,7 +242,6 @@ protected void process_message(.Message message) {
     DEBUG("%O got connect response code: %O\n", this, message->response_code);
   	if(connect_cb) connect_cb(this);
   }
-  
   else if(object_program(message) == .PublishMessage) {
 	  multiset cbs; 
 	  
@@ -413,12 +337,6 @@ protected void publish_rel_timeout_cb(.PendingResponse r) {
           throw(Error.Generic(sprintf("Publish message %d (QOS=AT_EXACTLY_ONCE, phase 2) was not acknowledged by server.\n", r->original_message->message_identifier)));
             // TODO failure callback
             if(r->data->failure) r->data->failure(r->original_message);
-}
-
-void acknowledge_pub(.Message message) {
-   .Message response = .PubAckMessage();
-   response->message_identifier = message->message_identifier;
-   send_message(response);
 }
   
   protected void reset_connection(void|int _local, mixed|void backtrace) {

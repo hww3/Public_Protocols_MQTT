@@ -3,11 +3,12 @@ object p;
 
 int main() {
 
-  p = Public.Protocols.MQTT.client("mqtt://localhost");
+  p = Public.Protocols.MQTT.client("mqtt://127.0.0.1");
 //  p = Public.Protocols.MQTT.client("mqtts://37.187.106.16");
   p->set_client_identifier("hww3-" + time());
   p->set_disconnect_callback(dis_cb);
   werror("Client: %O\n", p);
+  p->set_will_and_testament("hww3/test", "good bye, cruel world!", 2);
   p->connect(has_connected);
   werror("Client: %O\n", p);
  return -1;
@@ -18,7 +19,7 @@ void has_connected(object client) {
 	werror("Client connected: %O\n", client);
 	client->set_qos_level(2);
 	// client->subscribe("hww3/test", pub_cb);
-	for(int i = 0; i < 200; i++) call_out(client->publish, 0, "hww3/test", "client_connect" + i, 2);
+	for(int i = 0; i < 100; i++) call_out(client->publish, 0, "hww3/test", "client_connect" + i, 2);
 //	call_out(has_connected, 0, client);
 }
 
