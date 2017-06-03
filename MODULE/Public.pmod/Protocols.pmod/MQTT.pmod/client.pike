@@ -18,12 +18,8 @@ protected function(.client,.Reason:void) disconnect_cb;
 mapping(string:multiset) publish_callbacks = ([]);
 
 //! MQTT client
-//!
-//! Limitations:
-//! 
-//! error checking is less than ideal
 
-//!
+//! create a client which will connect to an mqtt server on the specified server and port.
 protected variant void create(string _host, int _port) {
    create("mqtt://" + host + ":" + port);
 }
@@ -31,7 +27,8 @@ protected variant void create(string _host, int _port) {
 //! create a client 
 //!
 //! @param _connect_url
-//!   A url in the form of mqtt://username:password@server:port or mqtts://username:password@server:port
+//!   A url in the form of  @tt{mqtt://[user[:password]@@][hostname][:port]@} or  @tt{mqtts://[user[:password]@@][hostname][:port]@}
+//!
 protected variant void create(string _connect_url) {
     connect_url = Standards.URI(_connect_url);
 	if(!(<"mqtt", "mqtts">)[connect_url->scheme]) throw(Error.Generic("Connect url must be of type mqtt or mqtts.\n"));
@@ -49,7 +46,8 @@ protected variant void create(string _connect_url) {
 	backend = Pike.DefaultBackend;
 }
 
-//!
+//! specify the will and testament message that will be sent by the server when
+//! this client disconnects.
 void set_will_and_testament(string topic, string(7bit) message, int(0..2) qos) {
   if(is_connected()) throw(Error.Generic("will and testament must be provided before connecting.\n"));
   if(!(topic && message)) throw(Error.Generic("Both will topic and message must be provided.\n"));
@@ -58,13 +56,16 @@ void set_will_and_testament(string topic, string(7bit) message, int(0..2) qos) {
    will_qos = qos;
 }
 
-//!
+//! connect and specify a method to be called when the connection successfully completes.
 variant void connect(function(.client:void) _connect_cb) {
 	connect_cb = _connect_cb;
 	connect();
 }
 
+//! connect to the server.
 //!
+//! @note
+//!  this method may return before the connection has succeeded or failed. 
 variant void connect() {
    if(connection_state != NOT_CONNECTED) throw(Error.Generic("Connection already in progress.\n"));
 	
@@ -118,7 +119,7 @@ variant void connect() {
    send_message(m);
 }
 
-//!
+//! specify a callback to be run when a client is disconnected.
 void set_disconnect_callback(function(.client,.Reason:void) cb) {
 	disconnect_cb = cb;
 }
@@ -162,7 +163,15 @@ void publish_sync(string topic, string msg, int|void qos_level) {
   }
 }
 
+//! subscribe to a topic at the qos level specified by @[set_qos_level]().
 //!
+//! @param publish_cb
+//!  a method which will be called for each message received. parameters include
+//!  the MQTT client, the topic and the message body. 
+//!
+//! @note
+//!  multiple subscriptions to a given topic may be made by calling this method
+//!  repeatedly with different callback methods.
 void subscribe(string topic, function(.client,string,string:void) publish_cb) {
     check_connected();  
   
@@ -179,12 +188,14 @@ void subscribe(string topic, function(.client,string,string:void) publish_cb) {
 
 }
 
-//!
+//! unsubscribe the specified publish callback from a topic. If all callbacks
+//! registered for a topic have been removed, the client will unsubscribe from the topic 
 void unsubscribe(string topic, function(.client,string,string:void) publish_cb) {
     check_connected();  
     multiset cbs = publish_callbacks[topic];
     if(!cbs) return 0;
 	if(cbs[publish_cb]) cbs[publish_cb] = 0;
+	
 	if(!sizeof(cbs)) {
 	    .UnsubscribeMessage message = .UnsubscribeMessage();
 	    message->message_identifier = get_message_identifier();
@@ -207,6 +218,7 @@ protected void ping_timeout() {
   disconnect();
 }
 
+//! method used internally by the MQTT client
 void send_message(.Message m) {
    ::send_message(m);
    if(timeout_callout_id) remove_call_out(timeout_callout_id);

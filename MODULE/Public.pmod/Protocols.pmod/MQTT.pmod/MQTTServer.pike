@@ -10,18 +10,22 @@ protected string bind_address;
 protected mapping clients = ([]);
 protected mapping subscriptions = ([]);
 
+protected int started;
 protected Stdio.Port port; 
+protected function(void:Stdio.Port)|program(Stdio.Port) port_program = Stdio.Port;
 protected program(.ServerConnection) connection_program = .ServerConnection;
 protected server_delegate delegate; 
 protected variant void create() {
   create(.protocol.MQTT_PORT);
 }
 
+//!
 protected variant void create(int port) {
   bind_port = port;
   create_delegate();
 }
 
+//!
 protected variant void create(int port, string address) {
   bind_port = port;
   bind_address = address;
@@ -38,24 +42,22 @@ protected void create_delegate() {
   delegate->publish = publish;
 }
 
-//!
-void set_port_object(Stdio.Port port_object) {
-  port = port_object;
+//! specify a port program to be used when starting the server.
+void set_port_program(function(void:Stdio.Port)|program(Stdio.Port) port_factory) {
+  if(started) throw(Error.Generic("Cannot specify port object: MQTTServer is already started.\n"));
+  port_program = port_factory;
 }
 
-//!
+//! bind to the specified port and enable the server
 void start() {
+  if(started) throw(Error.Generic("MQTTServer is already started.\n"));
+  started = 1;
   if(!port)
-    port = Stdio.Port();
+    port = port_program();
   port->bind(bind_port, accept_cb, bind_address);
 }
 
-//!
-Stdio.Port get_port() {
-  return port;
-}
-
-//!
+//! specify the server connection program to be used when accepting new connections.
 void set_connection_program(program(.ServerConnection) conn_program) {
   connection_program = conn_program;
 }
