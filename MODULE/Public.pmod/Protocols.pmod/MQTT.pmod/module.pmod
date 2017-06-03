@@ -3,6 +3,9 @@ constant QOS_AT_MOST_ONCE = 0;
 constant QOS_AT_LEAST_ONCE = 1;
 constant QOS_EXACTLY_ONCE = 2;
 
+constant __version = "@@version@@";
+constant __author = "@@author@@";
+
 mapping message_registry = ([]);
 
 #ifdef MQTT_DEBUG
