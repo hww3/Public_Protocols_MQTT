@@ -298,10 +298,57 @@ protected void process_message(.Message message) {
 	  DEBUG("PublishMessage topic: %s (qos=%d), %O\n", message->topic, qos, message->body);
 	  switch(qos) {
 	    case .QOS_AT_MOST_ONCE:
+			  if((cbs = publish_callbacks[message->topic])) {
+    		  	foreach(cbs; function callback;) {
+    		      DEBUG("Scheduling delivery of message from %s to %O\n", message->topic, callback);
+		  	      call_out(callback, 0, this, message->topic, message->body);
+		  	  	}
+			}
+// delivery to wildcards                                                                                                                          
+            foreach(publish_callback_matchers; .Matcher m; multiset cbs) {                                                                      
+              if(m->match(message->topic))                                                                                               
+                foreach(cbs; function callback;) {                                                                                             
+                    DEBUG("Scheduling delivery of wildcard matched message from %s to %O\n", message->topic, callback);                        
+                    call_out(callback, 0, this, message->topic, message->body);                                                                
+                }                                                                                                                                             
+            } 
 	      break;
 	    case .QOS_AT_LEAST_ONCE:
+	        int have_errors = 0;
+			if((cbs = publish_callbacks[message->topic])) { 
+				foreach(cbs; function callback;) {
+    		  	 	DEBUG("Performing delivery of message from %s to %O\n", message->topic, callback);
+		  		    mixed e = catch(callback(this, message->topic, message->body));
+		  		    if(e) { 
+                    	have_errors++; 
+                    	report_error(e);
+	          	  	}
+	       	 	}
+			}
+// delivery to wildcards                                                                                                                          
+            foreach(publish_callback_matchers; .Matcher m; multiset cbs) {                                                                      
+              if(m->match(message->topic))                                                                                               
+                foreach(cbs; function callback;) {                                                                                             
+                    DEBUG("Performing delivery of wildcard matched message from %s to %O\n", message->topic, callback);                        
+                    mixed e = catch(callback(this, message->topic, message->body));
+                    if(e) {
+                     have_errors++;
+                     report_error(e);
+                    }                                    
+                }                                                                                                                                             
+            } 
+	        if(!have_errors) acknowledge_pub(message);
+	          werror("One or more callbacks to an AT_LEAST_ONCE publish message failed. Not acknowledging, duplicates may occur.\n");
         break;
       case .QOS_EXACTLY_ONCE:
+	  
+      int message_identifier = message->message_identifier;
+      .Message message2 = .PubRecMessage();
+      message2->message_identifier = message_identifier;
+      send_message(message2);
+      mapping data = (["message": message]); // for storing callbacks later.
+      async_await_response(message2->message_identifier, message2, publish_response_timeout, max_retries, 
+        publish_rel_cb, publish_rel_timeout_cb, data);
 		break;
   	}
   }
