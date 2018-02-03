@@ -19,7 +19,7 @@ void decode_body(Stdio.Buffer body) {
   topic = read_string(body);
   if(qos_level > 0)
     message_identifier = read_word(body);
-  this.body = read_string(body);
+  this.body = (string)(body);
 }
 
 void encode_variable_header(Stdio.Buffer body) {
