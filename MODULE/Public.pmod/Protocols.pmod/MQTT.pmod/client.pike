@@ -194,6 +194,13 @@ void subscribe(string topic, function(.client,string,string:void) publish_cb) {
 DEBUG("adding matcher %O for %s\n", matcher, topic);                                                                                  
       publish_callback_matchers[matcher] += (<publish_cb>);  
     } else if(search(topic, "+") != -1) { // single level wildcard
+        .Matcher matcher;
+        matcher = make_matcher(.SingleLevelMatcher, topic);
+      
+        if(!publish_callback_matchers[matcher])                                                                                        
+          publish_callback_matchers[matcher] = (<>);  
+		  
+	      publish_callback_matchers[matcher] += (<publish_cb>);  
     } else {
       if(!publish_callbacks[topic])
   	  publish_callbacks[topic] = (<>);

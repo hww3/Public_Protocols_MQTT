@@ -1,5 +1,10 @@
 Version History
 
+Version 1.2
+- Add multi-level wildcard (#) support
+- Add single-level wildcard (+) support
+- Fix possible body parsing problem
+
 Version 1.1
 - Additional documentation
 - Minor code cleanup
