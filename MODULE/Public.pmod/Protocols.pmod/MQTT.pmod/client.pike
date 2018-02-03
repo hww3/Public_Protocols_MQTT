@@ -117,7 +117,7 @@ variant void connect() {
      m->will_message = will_message;
    }
    
-   send_message(m);
+   send_message_sync(m);
 }
 
 //! specify a callback to be run when a client is disconnected.
