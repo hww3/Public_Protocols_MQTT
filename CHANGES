@@ -3,6 +3,7 @@ Version History
 Version 1.2
 - Add multi-level wildcard (#) support
 - Add single-level wildcard (+) support
+- MQTTServer handles filter (wildcard) subsciptions
 - Fix possible body parsing problem
 
 Version 1.1
