@@ -426,15 +426,6 @@ protected void publish_rel_timeout_cb(.PendingResponse r) {
 	    disconnect_cb(this, .Reason(_local, backtrace));
 }
 
-mapping(string:.Matcher) matchers = ([]);
-
-.Matcher make_matcher(program(.Matcher) prog, string topic) {
-  .Matcher m;
-  if(m = matchers[topic])
-    return m;
-   else matchers[topic] = (m = prog(topic));
-   return m;
-}
 
 protected string _sprintf(mixed t) {
 	  return "MQTT.client(" + (string)connect_url + "=>" + CONNECT_STATES[connection_state] + ")";

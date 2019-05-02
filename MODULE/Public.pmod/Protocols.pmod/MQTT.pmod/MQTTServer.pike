@@ -19,6 +19,8 @@ protected variant void create() {
   create(.protocol.MQTT_PORT);
 }
 
+protected mapping(.Matcher:mapping) subscription_matchers = ([]);
+
 //!
 protected variant void create(int port) {
   bind_port = port;
@@ -93,22 +95,58 @@ protected int new_session(object session, string identifier) {
 
 protected int subscribe(object session, string topic, int qos) {
   DEBUG("SERVER: subscribe(%O, %O, %O)\n", session, topic, qos);
-  if(!subscriptions[topic]) subscriptions[topic] = ([]);
-  subscriptions[topic][session->get_client_identifier()] = qos;
+  
+  
+    if(search(topic, "#") != -1) { // multi level wildcard
+      .Matcher matcher;
+      if(topic == "#") {
+         matcher = make_matcher(.MatchAllWithoutDollar, topic);
+      } else {
+         matcher = make_matcher(.MatchWithPrefix, topic);
+      } 
+      
+      if(!subscription_matchers[matcher])                                                                                        
+        subscription_matchers[matcher] = ([]);                                                                                                  
+     
+DEBUG("adding matcher %O for %s\n", matcher, topic);                                                                                  
+      subscription_matchers[matcher][session->get_client_identifier()] = qos;
+    } else if(search(topic, "+") != -1) { // single level wildcard
+        .Matcher matcher;
+        matcher = make_matcher(.SingleLevelMatcher, topic);
+      
+        if(!subscription_matchers[matcher])                                                                                        
+          subscription_matchers[matcher] = ([]);  
+		  
+	      subscription_matchers[matcher][session->get_client_identifier()] = qos;
+    } else {
+	    if(!subscriptions[topic]) subscriptions[topic] = ([]);
+	    subscriptions[topic][session->get_client_identifier()] = qos;		  
+    }
+  
   return 1;
 }
 
 protected void unsubscribe(object session, string topic) {
   DEBUG("SERVER: unsubscribe(%O, %O)\n", session, topic);
-  mapping s = subscriptions[topic];
-  if(!s) return;
-  string ci = session->get_client_identifier();
+
+  if(has_wildcard(topic)) {
+    foreach(subscription_matchers; .Matcher m; mapping cbs) {
+       if(m->topic == topic) {
+        if(cbs[session->get_client_identifier()]) m_delete(cbs, session->get_client_identifier());
+
+  	  mapping s = subscriptions[topic];
+  		if(!s) return;
+  	  string ci = session->get_client_identifier();
   
-  if(s[ci]) m_delete(s, ci);
-  if(!sizeof(s)) m_delete(subscriptions, topic);
+ 	 if(s[ci]) m_delete(s, ci);
   
-  return;
-}
+  	if(!sizeof(s)) m_delete(subscriptions, topic);
+  
+  	return;
+  	}
+	}
+	}
+}  
 
 protected void client_disconnected(object session) {
   DEBUG("SERVER: client_disconnected(%O)\n", session);
@@ -124,12 +162,42 @@ protected void client_disconnected(object session) {
 
 protected int publish(object session, string topic, string message, int qos) {
   DEBUG("SERVER: publish(%O, %O, %O, %O)\n", session, topic, message, qos);
+  int i;
   mapping destinations = subscriptions[topic];
-  if(!destinations) return 1;
+  if(destinations)
   foreach(destinations; string identifier; int cqos) {
     object s = clients[identifier];
     if(!s) continue;
+	i++;
     s->publish(topic, message, qos&cqos);
   }
-  return 1;
+  
+  foreach(subscription_matchers; .Matcher m; mapping cbs) {
+      if(m->match(topic))                                                                                               
+        foreach(cbs; mixed identifier; int cqos) {                                                                                             
+            DEBUG("Performing delivery of wildcard matched message from %s to %O\n", message->topic, identifier);                        
+            
+			object s = clients[identifier];
+			if(!s) continue;
+			i++;
+			s->publish(topic, message, qos&cqos);
+        }                                     
+  }
+  
+  return !i;
+}
+
+mapping(string:.Matcher) matchers = ([]);
+
+.Matcher make_matcher(program(.Matcher) prog, string topic) {
+  .Matcher m;
+  if(m = matchers[topic])
+    return m;
+   else matchers[topic] = (m = prog(topic));
+   return m;
+}
+
+
+protected int(0..1) has_wildcard(string topic) {
+  return (search(topic, "#") != -1 || search(topic, "+") != -1);
 }
